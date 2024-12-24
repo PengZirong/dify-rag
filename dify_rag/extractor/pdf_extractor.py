@@ -27,22 +27,79 @@ class PdfExtractor(BaseExtractor):
         return fix_error_pdf_content(block_content)
 
     @staticmethod
-    def check_doc_header_or_footer(doc):
-        # 页眉和页脚，每页都应该具备且格式相同
-        format_map = {"header": [], "footer": []}
-        for page in doc:
-            text_blocks = page.get_text("blocks")
-            if not text_blocks:
+    def _collect_page_metrics(page):
+        """收集单页的页眉页脚度量数据"""
+        text_blocks = page.get_text("blocks")
+        if not text_blocks:
+            return None
+        
+        header_y, footer_y = float('inf'), float('-inf')
+        header_idx, footer_idx = -1, -1
+        header_height, footer_height = 0, 0
+
+        for idx, block in enumerate(text_blocks):
+            _, y0, _, y1, *_ = block
+            if y0 < header_y:
+                header_y, header_idx, header_height = y0, idx, y1 - y0
+            if y1 > footer_y:
+                footer_y, footer_idx, footer_height = y1, idx, y1 - y0
+
+        return {
+            'text_blocks': text_blocks,
+            'header_idx': header_idx,
+            'footer_idx': footer_idx,
+            'header_height': header_height,
+            'footer_height': footer_height
+        }
+
+    @staticmethod
+    def _should_remove_headers_footers(page_metrics, threshold=0.9):
+        """判断是否应该移除页眉页脚"""
+        if not page_metrics:
+            return False, False
+
+        header_heights = [m['header_height'] for m in page_metrics if m]
+        footer_heights = [m['footer_height'] for m in page_metrics if m]
+
+        def exists_common_height(heights):
+            if not heights:
+                return False
+            _, count = Counter(heights).most_common(1)[0]
+            return count / len(heights) >= threshold
+            
+        return exists_common_height(header_heights), exists_common_height(footer_heights)
+
+    @staticmethod
+    def filter_doc_header_or_footer(doc):
+        """
+        过滤文档中的页眉页脚
+        页眉和页脚，每页都应该具备且格式相同
+        """
+        page_metrics = [PdfExtractor._collect_page_metrics(page) for page in doc]
+
+        header_exists, footer_exists = PdfExtractor._should_remove_headers_footers(page_metrics)
+
+        if not header_exists and not footer_exists:
+            return [m['text_blocks'] for m in page_metrics if m]
+
+        filtered_page_blocks = []
+        for metrics in page_metrics:
+            if not metrics:
                 continue
-            format_map["header"].append(text_blocks[0][3] - text_blocks[0][1])
-            format_map["footer"].append(text_blocks[-1][3] - text_blocks[-1][1])
-        headers_count, footer_count = Counter(format_map["header"]), Counter(
-            format_map["footer"]
-        )
-        return (
-            max(headers_count.values()) / headers_count.total() >= 0.9,
-            max(footer_count.values()) / footer_count.total() >= 0.9,
-        )
+
+            indices_to_remove = set()
+            if header_exists and metrics['header_idx'] != -1:
+                indices_to_remove.add(metrics['header_idx'])
+            if footer_exists and metrics['footer_idx'] != -1:
+                indices_to_remove.add(metrics['footer_idx'])
+
+            filtered_blocks = [
+                block for idx, block in enumerate(metrics['text_blocks'])
+                if idx not in indices_to_remove
+            ]
+            filtered_page_blocks.append(filtered_blocks)
+
+        return filtered_page_blocks
 
     @staticmethod
     def split_completion(content, current_split):
@@ -56,13 +113,8 @@ class PdfExtractor(BaseExtractor):
         doc = pymupdf.open(self._file_path)
         toc = doc.get_toc()
         content, documents = "", []
-        header_exist, footer_exist = self.check_doc_header_or_footer(doc)
-        for page in doc:
-            text_blocks = page.get_text("blocks")
-            if header_exist:
-                text_blocks = text_blocks[1:]
-            if footer_exist:
-                text_blocks = text_blocks[:-1]
+        filtered_page_blocks = self.filter_doc_header_or_footer(doc)
+        for text_blocks in filtered_page_blocks:
             content += self.remove_invalid_char(text_blocks)
         if toc:
             prxfix_split = ""
